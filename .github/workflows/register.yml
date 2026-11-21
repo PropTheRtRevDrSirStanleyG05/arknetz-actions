@@ -1,0 +1,255 @@
+# ArkNetzWebWeaver — register.yml (LIVE workflow)
+# The domain-claim flow: processes REGISTER domain claims in the
+# registry shard repo it runs in.
+#
+# Where it lives: one copy in EACH registry shard repo
+# (arknetz-registry-00 … arknetz-registry-0f, under the master account
+# PropTheRtRevDrSirStanleyG05). The shared copy is kept in the
+# arknetz-actions repo; the source of truth is protocol/register.yml
+# in the client repo. It IS executed in every shard repo — a REGISTER
+# issue in a shard runs this workflow there.
+#
+# Flow (thread: claims via GitHub Issue, ~5-10 s):
+#   1. A user opens an Issue titled `REGISTER: computers.edu`.
+#   2. This workflow parses the title, normalises the domain and
+#      checks it: exact full string only (never a whole TLD), valid
+#      labels, not a banned word, not already in this shard.
+#   3. If the claim fails, the Action comments the reason on the
+#      Issue and closes it. Nothing is committed.
+#   4. If it passes, the Action appends the entry to registry.json,
+#      recompresses registry.json.zst (the canonical shard file),
+#      commits both, comments the success, and closes the Issue.
+#   5. The Root Master never goes through this flow — he writes
+#      direct to main (<1 s), enforced by GitHub repo permissions.
+#
+# Anti-bot is GitHub's own real-account verification (thread turn
+# 27-29): there is NO minimum account age and NO per-user
+# domain-claim limit in this workflow — Stanley rejected both.
+# The workflow runs on the free tier: ubuntu-latest + GITHUB_TOKEN
+# only, no paid services, no secrets.
+#
+# Banned-word list: keep in sync with DEFAULT_BANNED_WORDS in
+# src/lib/domains.ts. A word matches only as a whole domain label.
+
+name: Register domain
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+# One shard repo = one queue, so two claims for the same shard never
+# race on the same registry file. Different shards run in parallel.
+concurrency:
+  group: register-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  register:
+    # Only REGISTER issues trigger the claim flow; every other issue
+    # is left alone for humans.
+    if: startsWith(github.event.issue.title, 'REGISTER:')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this shard repo
+        uses: actions/checkout@v4
+
+      - name: Parse the REGISTER issue
+        id: parse
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_USER: ${{ github.event.issue.user.login }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          title = os.environ["ISSUE_TITLE"]
+          m = re.match(r"^REGISTER:\s*(.+?)\s*$", title)
+          domain = m.group(1).strip().lower().rstrip(".") if m else ""
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"domain={domain}\n")
+              out.write(f"claimant={os.environ['ISSUE_USER']}\n")
+          PY
+
+      - name: Ensure zstd and fetch the v2 dictionary
+        run: |
+          if ! command -v zstd >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y -qq zstd; fi
+          # Canonical shard files are compressed WITH the v2 dictionary
+          # (frame carries dict ID 0x41524B02). A bare `zstd -d` on one
+          # fails with "Dictionary mismatch", so the availability check
+          # below and the recompress step both need the dictionary.
+          # Fetched from the protocol repo (public, raw); if the fetch
+          # fails the steps below fall back to plain zstd and to the
+          # plain registry.json mirror, so a claim is never lost.
+          curl -fsSL -o zstd-dictionary-v2.bin https://raw.githubusercontent.com/PropTheRtRevDrSirStanleyG05/arknetz-protocol/main/zstd-dictionary-v2.bin || rm -f zstd-dictionary-v2.bin
+
+      - name: Check banned words and availability
+        id: check
+        env:
+          DOMAIN: ${{ steps.parse.outputs.domain }}
+          CLAIMANT: ${{ steps.parse.outputs.claimant }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess
+          domain = os.environ["DOMAIN"]
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          def reject(reason):
+              out.write("result=rejected\n")
+              out.write(f"reason={reason}\n")
+              out.close()
+              raise SystemExit(0)
+          # Exact full strings only: at least two labels, never a TLD.
+          labels = domain.split(".") if domain else []
+          if len(labels) < 2:
+              reject(f'"{domain}" is a top-level domain on its own. ArkNetzWebWeaver only registers exact full domain strings (for example computers.edu) - whole TLDs are never claimed.')
+          if len(domain) > 253 or any(len(l) > 63 for l in labels):
+              reject(f'"{domain}" is too long.')
+          if any(not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", l) for l in labels):
+              reject(f'"{domain}" is not a valid domain. Use lowercase letters, numbers and hyphens only.')
+          banned = {"admin", "root", "support", "abuse", "security", "postmaster", "webmaster", "arknetz", "protocol", "github", "archive", "localhost", "malware", "phishing", "scam", "spam", "example", "invalid", "test"}
+          hit = next((l for l in labels if l in banned), None)
+          if hit:
+              reject(f'"{domain}" cannot be registered - the word "{hit}" is reserved.')
+          # Shard check: this workflow runs in ONE shard repo
+          # (arknetz-registry-0x). A claim filed in the wrong shard
+          # must be refused, not written to the wrong shard — the
+          # app's resolver throws on a wrong-shard entry, so a wrong
+          # write would corrupt the registry instead of registering.
+          shard = hashlib.sha256(domain.encode()).hexdigest()[0]
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          owner = repo.split("/")[0] if "/" in repo else "PropTheRtRevDrSirStanleyG05"
+          want = f"arknetz-registry-0{shard}"
+          if not repo.endswith("/" + want):
+              reject(f'"{domain}" belongs in {want}, not this shard. Open the REGISTER issue there instead: https://github.com/{owner}/{want}/issues/new?title=REGISTER%3A+{domain}')
+          # Availability: decompress the canonical shard and look the
+          # domain up. A missing shard file means nothing is registered
+          # in this shard yet, so the domain is available.
+          # The canonical .zst is compressed WITH the v2 dictionary —
+          # decompress with it when we have it; a bare `zstd -d` on a
+          # dict frame fails with "Dictionary mismatch".
+          entries = {}
+          zst_cmd = ["zstd", "-d", "-c", "registry.json.zst"]
+          if os.path.exists("zstd-dictionary-v2.bin"):
+              zst_cmd = ["zstd", "-d", "-D", "zstd-dictionary-v2.bin", "-c", "registry.json.zst"]
+          try:
+              raw = subprocess.run(zst_cmd, capture_output=True, check=True).stdout
+              data = json.loads(raw)
+              entries = data if isinstance(data, dict) and "entries" not in data else {e["domain"]: e for e in data.get("entries", [])}
+          except FileNotFoundError:
+              # No zstd CLI on this runner: read the plain mirror.
+              try:
+                  with open("registry.json") as f:
+                      data = json.load(f)
+                  entries = data if isinstance(data, dict) and "entries" not in data else {e["domain"]: e for e in data.get("entries", [])}
+              except FileNotFoundError:
+                  entries = {}
+          except subprocess.CalledProcessError:
+              # No .zst yet: fall back to the plain registry.json mirror.
+              try:
+                  with open("registry.json") as f:
+                      data = json.load(f)
+                  entries = data if isinstance(data, dict) and "entries" not in data else {e["domain"]: e for e in data.get("entries", [])}
+              except FileNotFoundError:
+                  entries = {}
+          if domain in entries:
+              owner = entries[domain].get("owner", "someone else")
+              reject(f'"{domain}" is already registered to @{owner}. Pick a different domain.')
+          out.write("result=ok\n")
+          out.write("reason=\n")
+          out.close()
+          PY
+
+      - name: Reject the claim (already taken or banned)
+        if: steps.check.outputs.result == 'rejected'
+        uses: actions/github-script@v7
+        env:
+          DOMAIN: ${{ steps.parse.outputs.domain }}
+          REASON: ${{ steps.check.outputs.reason }}
+        with:
+          script: |
+            const domain = process.env.DOMAIN;
+            const reason = process.env.REASON;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Sorry — the claim for \`${domain}\` was refused.\n\n${reason}\n\nNothing was registered. Open a new issue with a different domain to try again.`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: "closed",
+              labels: ["invalid"],
+            });
+
+      - name: Commit the new registry entry
+        if: steps.check.outputs.result == 'ok'
+        env:
+          DOMAIN: ${{ steps.parse.outputs.domain }}
+          CLAIMANT: ${{ steps.parse.outputs.claimant }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          domain = os.environ["DOMAIN"]
+          claimant = os.environ["CLAIMANT"]
+          shard = hashlib.sha256(domain.encode()).hexdigest()[0]
+          # Load the current shard (plain JSON mirror is the working
+          # file; the .zst is rebuilt from it below).
+          try:
+              with open("registry.json") as f:
+                  data = json.load(f)
+          except FileNotFoundError:
+              data = {}
+          entries = data if isinstance(data, dict) and "entries" not in data else {e["domain"]: e for e in data.get("entries", [])}
+          repo = f"arknetz-site-{domain.replace('.', '-')}"
+          entries[domain] = {
+              "domain": domain,
+              "backend": f"gh:{claimant}/{repo}",
+              "shard": shard,
+              "owner": claimant,
+          }
+          with open("registry.json", "w") as f:
+              json.dump(entries, f, indent=2, sort_keys=True)
+              f.write("\n")
+          # Recompress WITH the v2 dictionary when we have it, so the
+          # canonical file keeps the dict ID every reader expects.
+          # Without it, plain zstd (the app reads both, but the
+          # canonical form stays dictionary-compressed).
+          zst_cmd = ["zstd", "-q", "-f", "registry.json", "-o", "registry.json.zst"]
+          if os.path.exists("zstd-dictionary-v2.bin"):
+              zst_cmd = ["zstd", "-q", "-D", "zstd-dictionary-v2.bin", "-f", "registry.json", "-o", "registry.json.zst"]
+          subprocess.run(zst_cmd, check=True)
+          PY
+          git config user.name "arknetz-register-bot"
+          git config user.email "arknetz-register-bot@users.noreply.github.com"
+          git add registry.json registry.json.zst
+          git commit -m "Register ${DOMAIN} for @${CLAIMANT}"
+          git push
+
+      - name: Confirm and close the issue
+        if: steps.check.outputs.result == 'ok'
+        uses: actions/github-script@v7
+        env:
+          DOMAIN: ${{ steps.parse.outputs.domain }}
+          CLAIMANT: ${{ steps.parse.outputs.claimant }}
+        with:
+          script: |
+            const domain = process.env.DOMAIN;
+            const claimant = process.env.CLAIMANT;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Done — \`${domain}\` is now registered to @${claimant}.\n\nYour site repo is \`gh:${claimant}/arknetz-site-${domain.replaceAll(".", "-")}\`. Open ArkNetzWebWeaver, sign in with GitHub, and start building.`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: "closed",
+              labels: ["registered"],
+            });
