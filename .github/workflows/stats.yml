@@ -1,0 +1,79 @@
+# ArkNetzWebWeaver — stats.yml (LIVE workflow)
+# Nightly rollup for the site repo it runs in (PROTOCOL.md §3.10):
+# read batched VIEW_PING Issues, tally anonymous per-page view counts
+# into stats.json (+ stats.yml + stats.json.zst), then close the
+# processed issues. Zero IP logging; Strict Offline/No-Telemetry
+# visitors never send pings.
+#
+# Output shape is the app's real SiteStats (src/lib/viewer/stats.ts):
+# { v: 1, domain, updated (unix ms), views: { page: count },
+#   totalViews, comments?, reactions?, plays? } — plus stats.yml, the
+# human-readable mirror the app's parseStatsYml reads back
+# (buildStatsYml layout: domain / updated ISO / total_views / views:).
+# VIEW_PING bodies are the app's format (formatViewPing in the same
+# module): `VIEW_PING: 2026-11-15 | index:1, about:1`.
+# An issue whose body is not a VIEW_PING is left open and ignored,
+# exactly like the app's rollupPings `ignored` count.
+# Runs nightly (02:00 UTC) and on manual dispatch. No pings = no commit.
+name: Stats rollup
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *" # nightly, 02:00 UTC
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  rollup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Roll up VIEW_PING issues into stats.json
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo, labels: "VIEW_PING", state: "open",
+            });
+            const domain = context.repo.repo.replace(/^arknetz-site-/, "").replaceAll("-", ".");
+            let stats = { v: 1, domain, updated: Date.now(), views: {}, totalViews: 0 };
+            try { stats = JSON.parse(fs.readFileSync("stats.json", "utf8")); } catch {}
+            if (stats.v !== 1 || typeof stats.views !== "object" || stats.views === null) {
+              // A stats.json in any older shape (e.g. the pre-0.1.0
+              // { domain, days, updated } draft) is not carried forward.
+              stats = { v: 1, domain, updated: Date.now(), views: {}, totalViews: 0 };
+            }
+            let tallied = 0;
+            for (const issue of issues) {
+              const body = issue.body || "";
+              const m = /^VIEW_PING:\s*(\d{4}-\d{2}-\d{2})\s*\|\s*(.+)$/.exec(body.trim());
+              if (!m) continue;
+              for (const part of m[2].split(",")) {
+                const [page, n] = part.trim().split(":");
+                const count = Number(n);
+                if (page && Number.isFinite(count) && count > 0) {
+                  stats.views[page] = (stats.views[page] || 0) + count;
+                  tallied += count;
+                }
+              }
+              await github.rest.issues.update({ owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number, state: "closed" });
+            }
+            if (tallied === 0) { console.log("No VIEW_PINGs to roll up."); return; }
+            stats.updated = Date.now();
+            stats.totalViews = Object.values(stats.views).reduce((a, b) => a + b, 0);
+            fs.writeFileSync("stats.json", JSON.stringify(stats, null, 2) + "\n");
+            const lines = [`domain: ${stats.domain}`, `updated: ${new Date(stats.updated).toISOString()}`, `total_views: ${stats.totalViews}`, "views:"];
+            for (const page of Object.keys(stats.views).sort()) lines.push(`  ${page}: ${stats.views[page]}`);
+            fs.writeFileSync("stats.yml", lines.join("\n") + "\n");
+      - name: Commit stats.json (+ stats.yml, + .zst where zstd is available)
+        run: |
+          git config user.name "arknetz-stats-bot"
+          git config user.email "arknetz-stats-bot@users.noreply.github.com"
+          if command -v zstd >/dev/null 2>&1; then zstd -q -f stats.json -o stats.json.zst; fi
+          git add stats.json stats.yml stats.json.zst 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Nightly stats rollup"
+          git push
