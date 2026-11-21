@@ -1,0 +1,36 @@
+# ArkNetzWebWeaver — cleanup.yml (LIVE workflow)
+# Monthly history squash for the central data repo it runs in
+# (PROTOCOL.md §5): `git checkout --orphan` a fresh root, commit the
+# current files, and force-push so the repo stays under ~50 MB.
+# Each repo that uses it keeps its own copy/schedule so a squash of
+# registry history never touches moderation, contacts, or feed.
+# Runs monthly (03:00 UTC on the 1st) and on manual dispatch.
+# WARNING: this rewrites history. Disable the schedule (not the file)
+# if a repo must keep full history.
+name: Cleanup (squash history)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 1 * *" # monthly, 03:00 UTC on the 1st
+
+permissions:
+  contents: write
+
+jobs:
+  squash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Squash history into one commit
+        run: |
+          git config user.name "arknetz-cleanup-bot"
+          git config user.email "arknetz-cleanup-bot@users.noreply.github.com"
+          git checkout --orphan squash-tmp
+          git add -A
+          git commit -m "Squash history (monthly cleanup)"
+          git branch -D main
+          git branch -m main
+          git push --force origin main
