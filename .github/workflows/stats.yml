@@ -73,7 +73,15 @@ jobs:
         run: |
           git config user.name "arknetz-stats-bot"
           git config user.email "arknetz-stats-bot@users.noreply.github.com"
-          if command -v zstd >/dev/null 2>&1; then zstd -q -f stats.json -o stats.json.zst; fi
+          # Guard 1 (2026-11-22 fix): with no VIEW_PINGs the rollup step
+          # writes no stats.json, and a bare `zstd` on the missing file
+          # fails the step under bash -e. Only compress when it exists.
+          if [ -f stats.json ] && command -v zstd >/dev/null 2>&1; then zstd -q -f stats.json -o stats.json.zst; fi
           git add stats.json stats.yml stats.json.zst 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "Nightly stats rollup"
-          git push
+          # Nothing staged (no pings) = clean pass, no push attempt.
+          git diff --cached --quiet && exit 0
+          git commit -m "Nightly stats rollup"
+          # Guard 2 (2026-11-22 fix): actions/checkout checks out a
+          # detached HEAD, so a bare `git push` fails ("not currently
+          # on a branch"). Push the explicit ref instead.
+          git push origin HEAD:${{ github.ref_name }}
